@@ -1,0 +1,133 @@
+#!/bin/bash
+
+# Copywrong & Copyleft Stéphane Tsacas, stephane@yichnal.fr, feb 25 2021
+# Do whatever you want with this code, but please keep the line above.
+
+
+usage() {
+    cat >&2 <<EOF
+Usage : bashflare [-s] [-n] [-v] [-h] [pattern]
+User will be prompted to enter 2 values : the API Token (input will be hidden) and the domain name.
+     -s : silent, nothing but error message will be printed (on stderr)
+     -c : check credentials only
+     -n : do nothing, print what will be done instead (output can be sent to sh -x)
+     -v : verbose mode, print some random messages
+     -h : print this help
+The pattern is matched against the string containing the id, hostname, IP address, and record type (A, MX, TXT, etc.).
+Matching lines will be displayed prefixed by + or - otherwise.
+The return value is 0 or the number of errors encoutered.
+Caveat : only 500 entries can be deleted at a time.
+EOF
+    exit 0
+}
+
+
+# We need jq to parse JSON
+JQ_DOWNLOAD="https://stedolan.github.io/jq/"
+type jq >/dev/null
+if [[ $? != 0 ]]; then
+    echo "jq not found, check $JQ_DOWNLOAD" >&2
+    exit 1;
+fi
+
+# If ^C set $? to number of errors.
+trap 'exit ${errors}' 2
+
+# Default option values
+silent=0
+donothing=""
+verbose=0
+check=0
+
+# Parse command line
+while getopts "sncvh" option; do
+    case "$option" in
+	s) silent=1
+	   ;;
+	n) donothing=echo
+	   ;;
+	c) check=1;
+	   ;;
+	v) verbose=1
+	   ;;
+	h) usage
+	   ;;
+    esac
+done
+
+shift $((OPTIND-1))
+pattern=${1:-'*'}
+
+read -rs -p "(input hidden) API Token : " API_TOKEN
+echo
+read -r -p "Domain name : " DOMAIN_NAME
+
+if [[ ${verbose} != 0 ]]; then echo pattern: "$pattern"; fi
+
+# Verify token
+if [[ ${verbose} != 0 ]]; then echo "Verifying token validity" >&2; fi
+answer=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+	      -H "Authorization: Bearer ${API_TOKEN}" \
+	      -H "Content-Type:application/json")
+
+status=$(echo "$answer" | jq -r .success)
+if [[ $status != "true" ]]; then
+    echo "$answer" | jq .errors >&2
+    exit 1
+else
+    if [[ ${verbose} != 0 ]]; then echo Token ok >&2; fi
+fi
+
+
+# Verify domain name
+if [[ ${verbose} != 0 ]]; then echo "Verifying domain name validity" >&2; fi
+answer=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=${DOMAIN_NAME}" \
+	      -H "Authorization: Bearer ${API_TOKEN}" \
+	      -H "Content-Type:application/json")
+
+status=$(echo "$answer" | jq -r '.result[0].name')
+ZONE_ID=$(echo "$answer" | jq -r '.result[0].id')
+
+if [[ $status != "$DOMAIN_NAME" ]]; then
+    echo "Domain not found" >&2
+    exit 1
+fi
+if [[ ${verbose} != 0 ]]; then echo "Domain name ok" >&2; fi
+if [[ ${check} != 0 ]]; then exit 0; fi
+
+n_records=0
+errors=0
+if [[ ${donothing} != 0 ]]; then quote=\"; else quote=""; fi
+
+curl -s -X GET https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?per_page=500 \
+     -H "Authorization: Bearer ${API_TOKEN}" \
+     -H "Content-Type:application/json" | \
+    jq -r '.result | .[] | .id + " " + .name + " " + .type + " " + .content' | \
+    while read id name atype content; do
+	# Does it marches the pattern ?
+	if [[ "$id $name $atype $content" != ${pattern} ]]; then
+	    if [[ $silent == 0 ]]; then echo ": -$id $name $atype $content" >&2; fi
+	    continue
+	else # Yes
+	    if [[ $silent == 0 ]]; then echo ": +$id $name $atype $content" >&2; fi
+	    answer=$(${donothing} curl -s -X DELETE https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${id} \
+			  -H ${quote}"Authorization: Bearer ${API_TOKEN}${quote}" \
+			  -H ${quote}"Content-Type: application/json${quote}")
+	    if [[ ${donothing} == "echo" ]]; then echo "$answer"; continue; fi
+
+	    status=$(echo "$answer" | jq -r '.success')
+	    if [[ "$status" != "true" ]]; then
+		(( errors++ ))
+		if [[ ${verbose} != 0 ]]; then
+		    echo "Error #$errors :" >&2
+		    echo "$answer" | jq -r '.' >&2
+		else
+		    : ; # If not verbose, print nothing on error
+		fi
+	    else
+		if [[ ${verbose} != 0 ]]; then printf "%-4d records deleted\r" $(( n_records++ )) >&2; fi
+	    fi
+	fi
+    done
+
+exit $errors
